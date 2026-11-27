@@ -14,3 +14,6 @@ iterations/
 *.user
 *.suo
 *.cache
+
+# Sensitive GitHub recovery credentials must never be committed
+github-recovery-codes.txt

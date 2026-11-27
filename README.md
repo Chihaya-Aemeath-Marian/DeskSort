@@ -2,6 +2,10 @@
 
 Windows 向けの WPF デスクトップ整理アプリです。カテゴリーごとに独立した枠を表示するため、エクスプローラーや他のアプリを通常どおり前面で操作できます。アプリ起動中は項目の重複を避けるため エクスプローラーのデスクトップアイコンを一時的に非表示にし、終了時に元へ戻します。デスクトップ項目自体の位置やファイルは移動しません。
 
+## v2.0.1
+
+ランタイムをサポート中の .NET 10 に移行しました。公開バイナリは Authenticode 署名なしです。配布 ZIP、依存関係スキャン結果、SHA-256 は GitHub Releases で確認してください。
+
 ## v2.0.0
 
 初回起動時に `ゲーム`、`ツール`、`SNS`、`エイメス` の4カテゴリーと既定の背景画像を作成します。既存の設定がある場合は維持されます。`your Aemeath` のトレイメニューからメインメニューやカテゴリーを操作でき、表示先モニターも選べます。Win+D でデスクトップを表示してもカテゴリーは残ります。v1.0.0 からの変更点は [RELEASE_NOTES_v2.0.0.md](RELEASE_NOTES_v2.0.0.md) を参照してください。
@@ -13,7 +17,7 @@ dotnet build DeskSort.csproj -c Release
 dotnet publish DeskSort.csproj -c Release -r win-x64 --self-contained false -o publish\win-x64
 ```
 
-公開フォルダー内の `デスク整理.exe` を起動します。.NET Core 3.1 用 Windows デスクトップ ランタイム が必要です。Release の実行ファイルや ZIP は Git に含めず、上記の `dotnet publish` で生成します。
+公開フォルダー内の `デスク整理.exe` を起動します。.NET 10 Windows Desktop Runtime が必要です。Release の実行ファイルや ZIP は Git に含めず、上記の `dotnet publish` で生成します。
 
 ## 設定とプロファイル
 
