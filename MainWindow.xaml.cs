@@ -19,6 +19,7 @@ using System.Threading.Tasks;
 using System.Security.Cryptography;
 using System.Text;
 using Microsoft.Win32;
+using Forms = System.Windows.Forms;
 
 namespace DeskSort
 {
@@ -38,9 +39,6 @@ public partial class MainWindow : Window
     private readonly Dictionary<string, string> _itemIcons = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, ItemIconTransformData> _itemIconTransforms = new Dictionary<string, ItemIconTransformData>(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, FenceWindow> _fenceWindows = new Dictionary<string, FenceWindow>();
-    private readonly ObservableCollection<ShowcasePicture> _showcasePictures = new ObservableCollection<ShowcasePicture>();
-    private ShowcaseWindow? _showcaseWindow;
-    private double _showcaseLeft = -1, _showcaseTop = -1, _showcaseWidth = 640, _showcaseHeight = 480;
     private readonly List<FileSystemWatcher> _watchers = new List<FileSystemWatcher>();
     private string? _selectedCategory;
     private bool _loading;
@@ -54,10 +52,15 @@ public partial class MainWindow : Window
     private double _smoothedAudioLevel;
     private double _audioVisualizerLeft = -1, _audioVisualizerTop = -1, _audioVisualizerWidth = 420, _audioVisualizerHeight = 120;
     private string _languageCode = "ja";
+    private Forms.NotifyIcon? _trayIcon;
+    private string _selectedMonitorDeviceName = string.Empty;
+    private bool _shutdownRequested;
+    private bool _restoringDesktopWindows;
 
     public MainWindow()
     {
         InitializeComponent();
+        SourceInitialized += (_, _) => WindowStyles.HideFromAltTab(this);
         InitializeProfiles();
         LoadSettings();
         Localization.SetLanguage(_languageCode);
@@ -76,7 +79,7 @@ public partial class MainWindow : Window
 
     private void Window_Loaded(object sender, RoutedEventArgs e)
     {
-        var area = SystemParameters.WorkArea;
+        var area = GetSelectedWorkArea();
         Left = area.Left + 18; Top = area.Top + 18;
         MinWidth = Math.Min(710, Math.Max(360, area.Width - 36));
         Width = Math.Max(MinWidth, Math.Min(900, area.Width - 36));
@@ -90,15 +93,47 @@ public partial class MainWindow : Window
         }
         _workspaceReady = true;
         AutoStartCheck.IsChecked = IsAutoStartEnabled();
+        InitializeTrayIcon();
         UpdateProfileTooltip();
         SyncAudioVisualizerButton();
         if (_audioVisualizerEnabled) StartAudioVisualizer();
+        Dispatcher.BeginInvoke(new Action(() => WindowStyles.HideFromAltTab(this)), System.Windows.Threading.DispatcherPriority.Loaded);
         Subtitle.Text = Localization.Get("Subtitle");
         RefreshBoard();
     }
 
+    private void Window_StateChanged(object? sender, EventArgs e)
+    {
+        if (!_workspaceReady || _restoringDesktopWindows || WindowState != WindowState.Minimized) return;
+        KeepDesktopWidgetsVisible();
+    }
+
+    private void KeepDesktopWidgetsVisible()
+    {
+        if (_restoringDesktopWindows) return;
+        _restoringDesktopWindows = true;
+        Dispatcher.BeginInvoke(new Action(() =>
+        {
+            try
+            {
+                if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+                WindowStyles.SendToDesktopLayer(this);
+                foreach (var fence in _fenceWindows.Values) fence.KeepVisibleOnDesktop();
+                _audioVisualizerWindow?.KeepVisibleOnDesktop();
+            }
+            finally { _restoringDesktopWindows = false; }
+        }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+    }
+
+    private void SetDesktopIconsVisible(bool visible)
+    {
+        if (!_restoreDesktopIcons || _desktopIconView == IntPtr.Zero) return;
+        ShowWindow(_desktopIconView, visible ? 5 : 0);
+    }
+
     private void Window_Closed(object sender, EventArgs e)
     {
+        if (_trayIcon != null) { _trayIcon.Visible = false; _trayIcon.Dispose(); _trayIcon = null; }
         _audioVisualizerTimer.Stop();
         _systemAudioMeter?.Dispose();
         _systemAudioMeter = null;
@@ -106,12 +141,172 @@ public partial class MainWindow : Window
         _audioVisualizerWindow = null;
         foreach (var fence in _fenceWindows.Values.ToList()) fence.Close();
         _fenceWindows.Clear();
-        _showcaseWindow?.Close();
         if (_restoreDesktopIcons && _desktopIconView != IntPtr.Zero) ShowWindow(_desktopIconView, 5);
     }
 
-    private void Close_Click(object sender, RoutedEventArgs e) { Close(); }
+    private void Window_Closing(object? sender, CancelEventArgs e)
+    {
+        if (_shutdownRequested) return;
+        e.Cancel = true;
+        Hide();
+    }
+
+    private void Close_Click(object sender, RoutedEventArgs e) { Hide(); }
     private void AudioVisualizerButton_Click(object sender, RoutedEventArgs e) { ToggleAudioVisualizer(); }
+
+    private void InitializeTrayIcon()
+    {
+        if (_trayIcon != null) return;
+        var menu = new Forms.ContextMenuStrip();
+        menu.Opening += (_, _) => PopulateTrayMenu(menu);
+        _trayIcon = new Forms.NotifyIcon
+        {
+            Text = "your Aemeath",
+            Icon = LoadTrayIcon(),
+            Visible = true,
+            ContextMenuStrip = menu
+        };
+        _trayIcon.MouseClick += (_, e) =>
+        {
+            if (e.Button != Forms.MouseButtons.Left) return;
+            if (IsVisible) Hide();
+            else ShowDesktopMenu();
+        };
+    }
+
+    private static System.Drawing.Icon LoadTrayIcon()
+    {
+        try
+        {
+            var executable = Process.GetCurrentProcess().MainModule?.FileName;
+            if (!string.IsNullOrWhiteSpace(executable))
+            {
+                var icon = System.Drawing.Icon.ExtractAssociatedIcon(executable);
+                if (icon != null) return icon;
+            }
+        }
+        catch { }
+        return System.Drawing.SystemIcons.Application;
+    }
+
+    private void ShowDesktopMenu()
+    {
+        Show();
+        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        WindowStyles.SendToDesktopLayer(this);
+    }
+
+    private void PopulateTrayMenu(Forms.ContextMenuStrip menu)
+    {
+        menu.Items.Clear();
+        var toolbar = new Forms.ToolStripMenuItem(IsVisible ? Localization.Get("HideDesktopMenu") : Localization.Get("ShowDesktopMenu"), null, (_, _) =>
+        {
+            if (IsVisible) Hide(); else ShowDesktopMenu();
+        }) { Checked = IsVisible, CheckOnClick = false };
+        menu.Items.Add(toolbar);
+
+        var search = new Forms.ToolStripTextBox { ToolTipText = Localization.Get("SearchDesktop"), Text = SearchBox.Text, AutoSize = false, Width = 210 };
+        search.TextChanged += (_, _) => { SearchBox.Text = search.Text; };
+        search.KeyDown += (_, e) => { if (e.KeyCode == Forms.Keys.Enter) { ShowDesktopMenu(); SearchBox.Focus(); e.Handled = true; } };
+        menu.Items.Add(search);
+        menu.Items.Add(new Forms.ToolStripMenuItem(Localization.Get("AddCategory"), null, (_, _) => AddCategory_Click(this, new RoutedEventArgs())));
+        menu.Items.Add(new Forms.ToolStripMenuItem(_audioVisualizerEnabled ? Localization.Get("AudioStop") : Localization.Get("AudioStart"), null, (_, _) => ToggleAudioVisualizer()) { Checked = _audioVisualizerEnabled, CheckOnClick = false });
+
+        var categories = new Forms.ToolStripMenuItem(Localization.Get("Categories"));
+        foreach (var category in _categories)
+        {
+            var categoryItem = new Forms.ToolStripMenuItem(category.Name) { Checked = category.Visible, CheckOnClick = true };
+            categoryItem.Click += (_, _) => { category.Visible = categoryItem.Checked; RefreshBoard(); };
+            categories.DropDownItems.Add(categoryItem);
+        }
+        menu.Items.Add(categories);
+
+        var profiles = new Forms.ToolStripMenuItem(Localization.Get("Profiles"));
+        foreach (var profile in _profileCatalog.Profiles)
+        {
+            var profileItem = new Forms.ToolStripMenuItem(profile.Name) { Checked = profile.Id == _activeProfileId, CheckOnClick = false };
+            profileItem.Click += (_, _) => SwitchProfile(profile.Id);
+            profiles.DropDownItems.Add(profileItem);
+        }
+        profiles.DropDownItems.Add(new Forms.ToolStripSeparator());
+        profiles.DropDownItems.Add(new Forms.ToolStripMenuItem(Localization.Get("CreateProfile"), null, (_, _) => CreateProfile()));
+        menu.Items.Add(profiles);
+
+        var languages = new Forms.ToolStripMenuItem(Localization.Get("Language"));
+        foreach (var choice in new[] { ("ja", "日本語"), ("zh-CN", "简体中文"), ("en", "English") })
+        {
+            var language = new Forms.ToolStripMenuItem(choice.Item2) { Checked = _languageCode == choice.Item1, CheckOnClick = false };
+            language.Click += (_, _) => SetLanguage(choice.Item1);
+            languages.DropDownItems.Add(language);
+        }
+        menu.Items.Add(languages);
+
+        var startup = new Forms.ToolStripMenuItem(Localization.Get("AutoStart")) { Checked = IsAutoStartEnabled(), CheckOnClick = true };
+        startup.Click += (_, _) => { AutoStartCheck.IsChecked = startup.Checked; AutoStart_Click(this, new RoutedEventArgs()); };
+        menu.Items.Add(startup);
+        menu.Items.Add(new Forms.ToolStripMenuItem(Localization.Get("Refresh"), null, (_, _) => Refresh_Click(this, new RoutedEventArgs())));
+        menu.Items.Add(new Forms.ToolStripMenuItem(Localization.Get("ShowAll"), null, (_, _) => ShowHidden_Click(this, new RoutedEventArgs())));
+
+        var monitors = new Forms.ToolStripMenuItem(Localization.Get("DisplayMonitor"));
+        var screens = Forms.Screen.AllScreens;
+        monitors.Enabled = screens.Length > 1;
+        if (screens.Length <= 1)
+            monitors.DropDownItems.Add(new Forms.ToolStripMenuItem(Localization.Get("OnlyOneDisplay")) { Enabled = false });
+        foreach (var screen in screens)
+        {
+            var label = screen.DeviceName + " · " + screen.Bounds.Width + "×" + screen.Bounds.Height + (screen.Primary ? " · " + Localization.Get("PrimaryDisplay") : string.Empty);
+            var display = new Forms.ToolStripMenuItem(label) { Checked = string.Equals(screen.DeviceName, _selectedMonitorDeviceName, StringComparison.OrdinalIgnoreCase), CheckOnClick = false };
+            display.Click += (_, _) => SelectMonitor(screen.DeviceName);
+            monitors.DropDownItems.Add(display);
+        }
+        menu.Items.Add(monitors);
+        menu.Items.Add(new Forms.ToolStripSeparator());
+        menu.Items.Add(new Forms.ToolStripMenuItem(Localization.Get("ExitRestore"), null, (_, _) =>
+        {
+            _shutdownRequested = true;
+            Close();
+        }));
+    }
+
+    private Rect GetSelectedWorkArea()
+    {
+        var screen = Forms.Screen.AllScreens.FirstOrDefault(s => string.Equals(s.DeviceName, _selectedMonitorDeviceName, StringComparison.OrdinalIgnoreCase))
+            ?? Forms.Screen.PrimaryScreen
+            ?? Forms.Screen.AllScreens.FirstOrDefault();
+        if (screen == null) return SystemParameters.WorkArea;
+        _selectedMonitorDeviceName = screen.DeviceName;
+        var bounds = screen.WorkingArea;
+        return new Rect(bounds.Left, bounds.Top, bounds.Width, bounds.Height);
+    }
+
+    internal Rect DesktopWorkArea => GetSelectedWorkArea();
+
+    private void SelectMonitor(string deviceName)
+    {
+        var screens = Forms.Screen.AllScreens;
+        if (screens.Length <= 1 || string.Equals(deviceName, _selectedMonitorDeviceName, StringComparison.OrdinalIgnoreCase)) return;
+        var previousArea = GetSelectedWorkArea();
+        _selectedMonitorDeviceName = screens.Any(s => string.Equals(s.DeviceName, deviceName, StringComparison.OrdinalIgnoreCase))
+            ? deviceName : Forms.Screen.PrimaryScreen?.DeviceName ?? string.Empty;
+        var nextArea = GetSelectedWorkArea();
+        var dx = nextArea.Left - previousArea.Left;
+        var dy = nextArea.Top - previousArea.Top;
+        _audioVisualizerLeft = Clamp(_audioVisualizerLeft < 0 ? nextArea.Right - _audioVisualizerWidth - 24 : _audioVisualizerLeft + dx, nextArea.Left, nextArea.Right - _audioVisualizerWidth);
+        _audioVisualizerTop = Clamp(_audioVisualizerTop < 0 ? nextArea.Bottom - _audioVisualizerHeight - 24 : _audioVisualizerTop + dy, nextArea.Top, nextArea.Bottom - _audioVisualizerHeight);
+        foreach (var category in _categories)
+        {
+            category.X = Clamp(category.X < 0 ? 12 : category.X, 0, Math.Max(0, nextArea.Width - category.PanelWidth));
+            category.Y = Clamp(category.Y < 0 ? 100 : category.Y, 0, Math.Max(0, nextArea.Height - Math.Max(180, category.PanelHeight)));
+        }
+        Left = Clamp(Left + dx, nextArea.Left, nextArea.Right - Width);
+        Top = Clamp(Top + dy, nextArea.Top, nextArea.Bottom - Height);
+        foreach (var category in _categories)
+            if (_fenceWindows.TryGetValue(category.Id, out var fence)) fence.MoveToSelectedMonitor();
+        _audioVisualizerWindow?.MoveToSelectedMonitor(_audioVisualizerLeft, _audioVisualizerTop);
+        SaveSettings();
+    }
+
+    private static double Clamp(double value, double minimum, double maximum) => Math.Max(minimum, Math.Min(value, Math.Max(minimum, maximum)));
     private void ProfilesButton_Click(object sender, RoutedEventArgs e)
     {
         var menu = new ContextMenu();
@@ -159,15 +354,17 @@ public partial class MainWindow : Window
         _audioVisualizerTimer.Stop(); _systemAudioMeter?.Dispose(); _systemAudioMeter = null;
         _audioVisualizerWindow?.Close(); _audioVisualizerWindow = null;
         foreach (var fence in _fenceWindows.Values.ToList()) fence.Close();
-        _fenceWindows.Clear(); _showcaseWindow?.Close(); _showcaseWindow = null;
+        _fenceWindows.Clear();
         foreach (var category in _categories) category.StopSlideshow();
-        _categories.Clear(); _shownCategories.Clear(); _assignments.Clear(); _itemIcons.Clear(); _itemIconTransforms.Clear(); _showcasePictures.Clear();
+        _categories.Clear(); _shownCategories.Clear(); _assignments.Clear(); _itemIcons.Clear(); _itemIconTransforms.Clear();
         _activeProfileId = id;
         _activeSettingsPath = ProfilePath(id);
         _profileCatalog.CurrentProfileId = id;
         SaveProfileCatalog();
         LoadSettings(); Localization.SetLanguage(_languageCode); ApplyBuiltInCategoryNames();
         Subtitle.Text = Localization.Get("Subtitle");
+        var selectedArea = GetSelectedWorkArea();
+        Left = selectedArea.Left + 18; Top = selectedArea.Top + 18;
         RefreshDesktop(); SyncAudioVisualizerButton();
         if (_workspaceReady && _audioVisualizerEnabled) StartAudioVisualizer();
         UpdateProfileTooltip();
@@ -358,35 +555,6 @@ public partial class MainWindow : Window
         catch (Exception ex) { AutoStartCheck.IsChecked = IsAutoStartEnabled(); MessageBox.Show(Localization.Get("StartupError") + ex.Message, Localization.Get("AppTitle")); }
     }
 
-    private void OpenShowcase_Click(object sender, RoutedEventArgs e)
-    {
-        if (_showcaseWindow == null)
-        {
-            _showcaseWindow = new ShowcaseWindow(this, _showcasePictures, _showcaseLeft, _showcaseTop, _showcaseWidth, _showcaseHeight);
-            _showcaseWindow.Closed += (_, _) => { _showcaseWindow = null; SaveSettings(); };
-            _showcaseWindow.Show();
-        }
-        else { if (!_showcaseWindow.IsVisible) _showcaseWindow.Show(); _showcaseWindow.Activate(); }
-    }
-    internal void AddShowcaseImages(IEnumerable<string> paths)
-    {
-        var folder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DeskSort", "showcase");
-        Directory.CreateDirectory(folder);
-        foreach (var source in paths.Where(File.Exists))
-        {
-            try
-            {
-                var dest = Path.Combine(folder, Guid.NewGuid().ToString("N") + Path.GetExtension(source)); File.Copy(source, dest, false);
-                _showcasePictures.Add(new ShowcasePicture(dest, 22 + (_showcasePictures.Count % 5) * 28, 22 + (_showcasePictures.Count % 5) * 28, 210, 150));
-            }
-            catch (Exception ex) { MessageBox.Show(Localization.Get("AddImagesError") + ex.Message, Localization.Get("AppTitle")); }
-        }
-        SaveSettings();
-    }
-    internal void RemoveShowcasePicture(ShowcasePicture picture) { _showcasePictures.Remove(picture); SaveSettings(); }
-    internal void SaveShowcaseBounds(double left, double top, double width, double height)
-    { _showcaseLeft = left; _showcaseTop = top; _showcaseWidth = width; _showcaseHeight = height; SaveSettings(); }
-
     private static IntPtr FindDesktopIconView()
     {
         var shell = FindWindow("Progman", null);
@@ -412,6 +580,7 @@ public partial class MainWindow : Window
 
     private void LoadSettings()
     {
+        var firstRun = !File.Exists(_activeSettingsPath);
         try
         {
             if (File.Exists(_activeSettingsPath))
@@ -420,15 +589,12 @@ public partial class MainWindow : Window
                 if (state != null)
                 {
                     _audioVisualizerEnabled = state.AudioVisualizerEnabled;
+                    _selectedMonitorDeviceName = state.SelectedMonitorDeviceName ?? string.Empty;
                     _languageCode = string.IsNullOrWhiteSpace(state.LanguageCode) ? "ja" : state.LanguageCode;
                     _audioVisualizerLeft = state.AudioVisualizerLeft;
                     _audioVisualizerTop = state.AudioVisualizerTop;
                     _audioVisualizerWidth = state.AudioVisualizerWidth > 0 ? state.AudioVisualizerWidth : 420;
                     _audioVisualizerHeight = state.AudioVisualizerHeight > 0 ? state.AudioVisualizerHeight : 120;
-                    foreach (var picture in state.ShowcasePictures ?? new List<ShowcasePictureData>()) _showcasePictures.Add(new ShowcasePicture(picture.SourcePath, picture.X, picture.Y, picture.Width, picture.Height));
-                    _showcaseLeft = state.ShowcaseLeft; _showcaseTop = state.ShowcaseTop;
-                    _showcaseWidth = state.ShowcaseWidth > 0 ? state.ShowcaseWidth : 640;
-                    _showcaseHeight = state.ShowcaseHeight > 0 ? state.ShowcaseHeight : 480;
                     foreach (var c in state.Categories ?? new List<CategoryData>())
                     {
                         var name = c.Name switch { "文档" => "書類", "图片" => "画像", "表格" => "表計算", "应用与安装包" => "アプリ・インストーラー", "其他" => "その他", _ => c.Name };
@@ -443,12 +609,37 @@ public partial class MainWindow : Window
         catch { }
         if (_categories.Count == 0)
         {
-            _categories.Add(new CategoryModel("docs", "書類", "#788A9E", true, "📄"));
-            _categories.Add(new CategoryModel("images", "画像", "#B47F73", true, "🖼"));
-            _categories.Add(new CategoryModel("sheets", "表計算", "#748C70", true, "▦"));
-            _categories.Add(new CategoryModel("installers", "アプリ・インストーラー", "#A78C5C", true, "📦"));
-            _categories.Add(new CategoryModel("other", "その他", "#8E7CA7", true, "✦"));
+            if (firstRun)
+            {
+                _categories.Add(new CategoryModel("game", "ゲーム", "#8E7CA7", true, "🎮", backgroundImagePath: InstallBundledDefaultBackground("game-aemeath.jpg")));
+                _categories.Add(new CategoryModel("tools", "ツール", "#788A9E", true, "🛠", backgroundImagePath: InstallBundledDefaultBackground("tools-aemeath.png")));
+                _categories.Add(new CategoryModel("sns", "SNS", "#B47F73", true, "✦", backgroundImagePath: InstallBundledDefaultBackground("sns-aemeath.png")));
+                _categories.Add(new CategoryModel("aemeath", "エイメス", "#748C70", true, "🌸", backgroundImagePath: InstallBundledDefaultBackground("aemeath-garden.png")));
+            }
+            else
+            {
+                _categories.Add(new CategoryModel("docs", "書類", "#788A9E", true, "📄"));
+                _categories.Add(new CategoryModel("images", "画像", "#B47F73", true, "🖼"));
+                _categories.Add(new CategoryModel("sheets", "表計算", "#748C70", true, "▦"));
+                _categories.Add(new CategoryModel("installers", "アプリ・インストーラー", "#A78C5C", true, "📦"));
+                _categories.Add(new CategoryModel("other", "その他", "#8E7CA7", true, "✦"));
+            }
         }
+    }
+
+    private static string? InstallBundledDefaultBackground(string fileName)
+    {
+        var bundledPath = Path.Combine(AppContext.BaseDirectory, "assets", "DefaultBackgrounds", fileName);
+        if (!File.Exists(bundledPath)) return null;
+        var destinationFolder = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "DeskSort", "default-backgrounds");
+        var destination = Path.Combine(destinationFolder, fileName);
+        try
+        {
+            Directory.CreateDirectory(destinationFolder);
+            if (!File.Exists(destination)) File.Copy(bundledPath, destination, false);
+            return destination;
+        }
+        catch { return bundledPath; }
     }
 
     internal void SaveSettings()
@@ -456,7 +647,7 @@ public partial class MainWindow : Window
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(_activeSettingsPath)!);
-            var state = new SettingsData { LanguageCode = _languageCode, AudioVisualizerEnabled = _audioVisualizerEnabled, AudioVisualizerLeft = _audioVisualizerLeft, AudioVisualizerTop = _audioVisualizerTop, AudioVisualizerWidth = _audioVisualizerWidth, AudioVisualizerHeight = _audioVisualizerHeight, Categories = _categories.Select(c => new CategoryData(c.Id, c.Name, c.Color, c.Visible, c.Icon, c.IconImagePath, c.BackgroundColor, c.IsExpanded, c.X, c.Y, c.BackgroundImagePath, c.BackgroundImageScale, c.BackgroundImageFit, c.BackgroundImagePositionX, c.BackgroundImagePositionY, c.PanelWidth, double.IsNaN(c.PanelHeight) ? 0 : c.PanelHeight, c.SlideshowFolderPath)).ToList(), Assignments = new Dictionary<string, string>(_assignments, StringComparer.OrdinalIgnoreCase), ItemIcons = new Dictionary<string, string>(_itemIcons, StringComparer.OrdinalIgnoreCase), ItemIconTransforms = _itemIconTransforms.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase), ShowcasePictures = _showcasePictures.Select(p => new ShowcasePictureData(p.SourcePath, p.X, p.Y, p.Width, p.Height)).ToList(), ShowcaseLeft = _showcaseLeft, ShowcaseTop = _showcaseTop, ShowcaseWidth = _showcaseWidth, ShowcaseHeight = _showcaseHeight };
+            var state = new SettingsData { LanguageCode = _languageCode, SelectedMonitorDeviceName = _selectedMonitorDeviceName, AudioVisualizerEnabled = _audioVisualizerEnabled, AudioVisualizerLeft = _audioVisualizerLeft, AudioVisualizerTop = _audioVisualizerTop, AudioVisualizerWidth = _audioVisualizerWidth, AudioVisualizerHeight = _audioVisualizerHeight, Categories = _categories.Select(c => new CategoryData(c.Id, c.Name, c.Color, c.Visible, c.Icon, c.IconImagePath, c.BackgroundColor, c.IsExpanded, c.X, c.Y, c.BackgroundImagePath, c.BackgroundImageScale, c.BackgroundImageFit, c.BackgroundImagePositionX, c.BackgroundImagePositionY, c.PanelWidth, double.IsNaN(c.PanelHeight) ? 0 : c.PanelHeight, c.SlideshowFolderPath)).ToList(), Assignments = new Dictionary<string, string>(_assignments, StringComparer.OrdinalIgnoreCase), ItemIcons = new Dictionary<string, string>(_itemIcons, StringComparer.OrdinalIgnoreCase), ItemIconTransforms = _itemIconTransforms.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.OrdinalIgnoreCase) };
             File.WriteAllText(_activeSettingsPath, JsonSerializer.Serialize(state, new JsonSerializerOptions { WriteIndented = true }));
         }
         catch (Exception ex) { Subtitle.Text = Localization.Get("SaveSettingsError") + ex.Message; }
@@ -496,7 +687,16 @@ public partial class MainWindow : Window
     private CategoryModel AutoCategory(string path)
     {
         var ext = Path.GetExtension(path).ToLowerInvariant();
-        var target = ext switch
+        var isReleasePreset = _categories.Any(c => c.Id == "game" || c.Id == "tools" || c.Id == "sns" || c.Id == "aemeath");
+        var target = isReleasePreset ? ext switch
+        {
+            ".png" or ".jpg" or ".jpeg" or ".gif" or ".bmp" or ".webp" or ".svg" or ".heic" => "aemeath",
+            ".xls" or ".xlsx" or ".csv" or ".tsv" or ".doc" or ".docx" or ".pdf" or ".txt" or ".md" or ".rtf" or ".ppt" or ".pptx" => "tools",
+            ".exe" => "game",
+            ".url" => "sns",
+            ".msi" or ".zip" or ".7z" or ".rar" or ".appx" => "tools",
+            _ => "tools"
+        } : ext switch
         {
             ".png" or ".jpg" or ".jpeg" or ".gif" or ".bmp" or ".webp" or ".svg" or ".heic" => "images",
             ".xls" or ".xlsx" or ".csv" or ".tsv" => "sheets",
@@ -504,7 +704,7 @@ public partial class MainWindow : Window
             ".exe" or ".msi" or ".zip" or ".7z" or ".rar" or ".appx" => "installers",
             _ => "other"
         };
-        return _categories.FirstOrDefault(c => c.Id == target) ?? _categories.Last();
+        return _categories.FirstOrDefault(c => c.Id == target) ?? _categories.FirstOrDefault(c => c.Id == "other") ?? _categories.Last();
     }
 
     private CategoryModel? FindCategory(string path)
@@ -515,7 +715,8 @@ public partial class MainWindow : Window
 
     private void RefreshBoard()
     {
-        var areaWidth = SystemParameters.WorkArea.Width - 56;
+        var workArea = GetSelectedWorkArea();
+        var areaWidth = workArea.Width - 56;
         var columns = Math.Max(1, (int)Math.Floor((areaWidth + 20) / 440));
         for (var i = 0; i < _categories.Count; i++)
         {
@@ -525,6 +726,8 @@ public partial class MainWindow : Window
                 _categories[i].Y = 100 + (i / columns) * 265;
             }
             else if (_categories[i].Y < 92) _categories[i].Y = 100;
+            _categories[i].X = Clamp(_categories[i].X, 0, Math.Max(0, workArea.Width - _categories[i].PanelWidth));
+            _categories[i].Y = Clamp(_categories[i].Y, 0, Math.Max(0, workArea.Height - Math.Max(180, _categories[i].PanelHeight)));
         }
         _shownCategories.Clear();
         foreach (var c in _categories.Where(c => c.Visible && (_selectedCategory == null || c.Id == _selectedCategory))) _shownCategories.Add(c);
@@ -556,7 +759,7 @@ public partial class MainWindow : Window
         try
         {
             fence.DragMove();
-            var work = SystemParameters.WorkArea;
+            var work = GetSelectedWorkArea();
             fence.Left = Math.Max(work.Left, Math.Min(fence.Left, work.Right - fence.ActualWidth));
             fence.Top = Math.Max(work.Top, Math.Min(fence.Top, work.Bottom - fence.ActualHeight));
             category.X = Math.Max(0, fence.Left - work.Left);
@@ -1084,7 +1287,7 @@ public sealed class AudioVisualizerWindow : Window
     public AudioVisualizerWindow(MainWindow controller, double left, double top, double width, double height)
     {
         _controller = controller;
-        var area = SystemParameters.WorkArea;
+        var area = controller.DesktopWorkArea;
         Width = Math.Max(300, Math.Min(area.Width - 24, width > 0 ? width : 420));
         Height = Math.Max(100, Math.Min(area.Height - 24, height > 0 ? height : 120));
         Left = left >= 0 ? left : area.Right - Width - 24;
@@ -1099,6 +1302,7 @@ public sealed class AudioVisualizerWindow : Window
         Topmost = false; ShowActivated = false; ShowInTaskbar = false;
         SourceInitialized += (_, _) => WindowStyles.HideFromAltTab(this);
         Loaded += (_, _) => Dispatcher.BeginInvoke(new Action(() => WindowStyles.HideFromAltTab(this)), System.Windows.Threading.DispatcherPriority.Loaded);
+        StateChanged += (_, _) => { if (WindowState == WindowState.Minimized) Dispatcher.BeginInvoke(new Action(KeepVisibleOnDesktop), System.Windows.Threading.DispatcherPriority.ApplicationIdle); };
 
         var layout = new Grid();
         layout.RowDefinitions.Add(new RowDefinition { Height = new GridLength(30) });
@@ -1149,6 +1353,19 @@ public sealed class AudioVisualizerWindow : Window
             var wave = 0.16 + 0.84 * Math.Abs(Math.Sin(i * 0.63 + time * 1.8) * Math.Cos(i * 0.21 - time * 0.7));
             _bars[i].Height = 2 + 42 * Math.Pow(level, 0.72) * wave;
         }
+    }
+
+    internal void MoveToSelectedMonitor(double left, double top)
+    {
+        var area = _controller.DesktopWorkArea;
+        Left = Math.Max(area.Left, Math.Min(left, area.Right - Width));
+        Top = Math.Max(area.Top, Math.Min(top, area.Bottom - Height));
+    }
+
+    internal void KeepVisibleOnDesktop()
+    {
+        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        WindowStyles.SendToDesktopLayer(this);
     }
 
     private void ScheduleBoundsSave()
@@ -1250,6 +1467,7 @@ public sealed class DesktopItem : INotifyPropertyChanged
 internal sealed class SettingsData
 {
     public string LanguageCode { get; set; } = "ja";
+    public string? SelectedMonitorDeviceName { get; set; }
     public bool AudioVisualizerEnabled { get; set; }
     public double AudioVisualizerLeft { get; set; } = -1;
     public double AudioVisualizerTop { get; set; } = -1;
@@ -1261,11 +1479,6 @@ internal sealed class SettingsData
     public Dictionary<string, string>? Assignments { get; set; }
     public Dictionary<string, string>? ItemIcons { get; set; }
     public Dictionary<string, ItemIconTransformData>? ItemIconTransforms { get; set; }
-    public List<ShowcasePictureData>? ShowcasePictures { get; set; }
-    public double ShowcaseLeft { get; set; } = -1;
-    public double ShowcaseTop { get; set; } = -1;
-    public double ShowcaseWidth { get; set; } = 640;
-    public double ShowcaseHeight { get; set; } = 480;
 }
 internal sealed class ConfigurationProfileCatalog
 {
@@ -1296,119 +1509,27 @@ internal static class WindowStyles
         }
         catch { }
     }
+    internal static void SendToDesktopLayer(Window window)
+    {
+        try
+        {
+            var hwnd = new WindowInteropHelper(window).Handle;
+            if (hwnd == IntPtr.Zero) return;
+            ShowWindow(hwnd, 4); // SW_SHOWNOACTIVATE
+            SetWindowPos(hwnd, new IntPtr(1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010 | 0x0040 | 0x0200);
+        }
+        catch { }
+    }
     [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)] private static extern int GetWindowLong(IntPtr hwnd, int index);
     [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)] private static extern int SetWindowLong(IntPtr hwnd, int index, int value);
     [DllImport("user32.dll", SetLastError = true)] private static extern bool SetWindowPos(IntPtr hwnd, IntPtr insertAfter, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hwnd, int command);
 }
 internal sealed class ItemIconTransformData
 {
     public double Scale { get; set; } = 1.0; public double PositionX { get; set; } = 0.5; public double PositionY { get; set; } = 0.5;
     public ItemIconTransformData() { }
     public ItemIconTransformData(double scale, double x, double y) { Scale = scale; PositionX = x; PositionY = y; }
-}
-internal sealed class ShowcasePictureData
-{
-    public string SourcePath { get; set; } = ""; public double X { get; set; } public double Y { get; set; } public double Width { get; set; } public double Height { get; set; }
-    public ShowcasePictureData() { }
-    public ShowcasePictureData(string path, double x, double y, double width, double height) { SourcePath = path; X = x; Y = y; Width = width; Height = height; }
-}
-internal sealed class ShowcasePicture
-{
-    public string SourcePath { get; } public ImageSource? Source { get; }
-    public double X { get; set; } public double Y { get; set; } public double Width { get; set; } public double Height { get; set; }
-    public ShowcasePicture(string path, double x, double y, double width, double height)
-    {
-        SourcePath = path; X = x; Y = y; Width = width; Height = height;
-        try { var image = new BitmapImage(); image.BeginInit(); image.CacheOption = BitmapCacheOption.OnLoad; image.UriSource = new Uri(path, UriKind.Absolute); image.EndInit(); image.Freeze(); Source = image; } catch { }
-    }
-}
-
-public sealed class ShowcaseWindow : Window
-{
-    private readonly MainWindow _controller; private readonly ObservableCollection<ShowcasePicture> _pictures; private readonly Canvas _canvas = new Canvas(); private readonly ImageSource? _sakuraFrame;
-    private Border? _toolbar; private Thumb? _windowResizeGrip; private readonly System.Windows.Threading.DispatcherTimer _hideUiTimer;
-    internal ShowcaseWindow(MainWindow controller, ObservableCollection<ShowcasePicture> pictures, double left, double top, double width, double height)
-    {
-        _controller = controller; _pictures = pictures; Title = Localization.Get("GalleryTitle"); Width = Math.Max(420, width); Height = Math.Max(320, height); MinWidth = 360; MinHeight = 260;
-        _sakuraFrame = LoadSakuraFrame();
-        _hideUiTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1200) };
-        _hideUiTimer.Tick += (_, _) => { _hideUiTimer.Stop(); if (!IsPointerOverControlArea()) SetFloatingUi(false); };
-        WindowStartupLocation = left < 0 || top < 0 ? WindowStartupLocation.CenterScreen : WindowStartupLocation.Manual;
-        if (left >= 0 && top >= 0) { Left = left; Top = top; }
-        WindowStyle = WindowStyle.None; ResizeMode = ResizeMode.NoResize; AllowsTransparency = true; Background = Brushes.Transparent; Topmost = false; ShowInTaskbar = false;
-        SourceInitialized += (_, _) => WindowStyles.HideFromAltTab(this);
-        Loaded += (_, _) => Dispatcher.BeginInvoke(new Action(() => WindowStyles.HideFromAltTab(this)), System.Windows.Threading.DispatcherPriority.Loaded);
-        var root = new Grid { Background = Brushes.Transparent };
-        var displayArea = new Grid { Margin = new Thickness(28), Background = Brushes.Transparent };
-        var scroll = new ScrollViewer { HorizontalScrollBarVisibility = ScrollBarVisibility.Hidden, VerticalScrollBarVisibility = ScrollBarVisibility.Hidden, Background = Brushes.Transparent, Content = _canvas };
-        displayArea.Children.Add(scroll); root.Children.Add(displayArea);
-        var toolbarContent = new StackPanel { Orientation = Orientation.Horizontal };
-        var moveHandle = new TextBlock { Text = "🌸", FontSize = 15, VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(8, 0, 6, 0), Cursor = Cursors.SizeAll, ToolTip = Localization.Get("GalleryMove") };
-        moveHandle.MouseLeftButtonDown += (_, e) => { try { DragMove(); } catch { } e.Handled = true; };
-        var add = new Button { Content = "＋", ToolTip = Localization.Get("GalleryAdd"), Width = 30, Height = 30, Margin = new Thickness(2), Background = new SolidColorBrush(Color.FromArgb(28, 235, 19, 192)), Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#C94388")), BorderThickness = new Thickness(0), FontSize = 18 };
-        add.Click += (_, _) => { var picker = new OpenFileDialog { Title = Localization.Get("SelectGalleryImages"), Filter = Localization.Get("ImageFiles") + "|*.png;*.jpg;*.jpeg;*.bmp;*.gif;*.webp|" + Localization.Get("AllFiles") + "|*.*", Multiselect = true }; if (picker.ShowDialog(this) == true) _controller.AddShowcaseImages(picker.FileNames); };
-        var close = new Button { Content = "×", ToolTip = Localization.Get("GalleryClose"), Width = 30, Height = 30, Margin = new Thickness(2), Background = Brushes.Transparent, Foreground = new SolidColorBrush((Color)ColorConverter.ConvertFromString("#8A6676")), BorderThickness = new Thickness(0), FontSize = 17 };
-        close.Click += (_, _) => Close(); toolbarContent.Children.Add(moveHandle); toolbarContent.Children.Add(add); toolbarContent.Children.Add(close);
-        var toolbar = new Border { Child = toolbarContent, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Top, Margin = new Thickness(0, 34, 30, 0), Padding = new Thickness(3), Background = new SolidColorBrush(Color.FromArgb(218, 255, 248, 251)), BorderBrush = new SolidColorBrush(Color.FromArgb(210, 255, 255, 255)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(18), Effect = new System.Windows.Media.Effects.DropShadowEffect { BlurRadius = 12, ShadowDepth = 2, Opacity = 0.16 }, Opacity = _pictures.Count == 0 ? 1 : 0, IsHitTestVisible = _pictures.Count == 0 };
-        _toolbar = toolbar; toolbar.MouseEnter += (_, _) => _hideUiTimer.Stop(); toolbar.MouseLeave += (_, _) => ScheduleUiHide();
-        root.Children.Add(toolbar);
-        var resize = new Thumb { Width = 30, Height = 30, HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Bottom, Cursor = Cursors.SizeNWSE, Background = Brushes.Transparent, BorderThickness = new Thickness(0), ToolTip = Localization.Get("GalleryResize"), Opacity = _pictures.Count == 0 ? 1 : 0, IsHitTestVisible = _pictures.Count == 0 };
-        _windowResizeGrip = resize; resize.MouseEnter += (_, _) => _hideUiTimer.Stop(); resize.MouseLeave += (_, _) => ScheduleUiHide();
-        resize.DragDelta += (_, e) => { Width = Math.Max(MinWidth, Width + e.HorizontalChange); Height = Math.Max(MinHeight, Height + e.VerticalChange); };
-        resize.DragCompleted += (_, _) => SaveBounds(); root.Children.Add(resize);
-        root.Children.Add(new TextBlock { Text = "❀", FontSize = 18, Foreground = new SolidColorBrush(Color.FromArgb(205, 207, 115, 151)), HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Bottom, Margin = new Thickness(0, 0, 3, 1), IsHitTestVisible = false, Opacity = 0 });
-        if (_sakuraFrame != null) root.Children.Add(new Image { Source = _sakuraFrame, Stretch = Stretch.Fill, IsHitTestVisible = false });
-        Content = root;
-        _pictures.CollectionChanged += Pictures_CollectionChanged; SizeChanged += (_, _) => SaveBounds(); LocationChanged += (_, _) => SaveBounds(); Closed += (_, _) => { _pictures.CollectionChanged -= Pictures_CollectionChanged; SaveBounds(); };
-        Rebuild();
-    }
-    private static ImageSource? LoadSakuraFrame()
-    {
-        try
-        {
-            var path = Path.Combine(AppContext.BaseDirectory, "assets", "SakuraFrame.png"); if (!File.Exists(path)) return null;
-            var image = new BitmapImage(); image.BeginInit(); image.CacheOption = BitmapCacheOption.OnLoad; image.UriSource = new Uri(path, UriKind.Absolute); image.EndInit(); image.Freeze(); return image;
-        }
-        catch { return null; }
-    }
-    private void SetFloatingUi(bool visible)
-    {
-        if (_toolbar != null) { _toolbar.Opacity = visible ? 1 : 0; _toolbar.IsHitTestVisible = visible; }
-        if (_windowResizeGrip != null) { _windowResizeGrip.Opacity = visible ? 1 : 0; _windowResizeGrip.IsHitTestVisible = visible; }
-    }
-    private bool IsPointerOverControlArea() => (_toolbar?.IsMouseOver ?? false) || (_windowResizeGrip?.IsMouseOver ?? false) || _canvas.Children.OfType<FrameworkElement>().Any(x => x.IsMouseOver);
-    private void ScheduleUiHide() { _hideUiTimer.Stop(); _hideUiTimer.Start(); }
-    private void Pictures_CollectionChanged(object? sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e) => Rebuild();
-    private void SaveBounds() { if (IsLoaded && WindowState == WindowState.Normal) _controller.SaveShowcaseBounds(Left, Top, Width, Height); }
-    private void Rebuild()
-    {
-        _canvas.Children.Clear();
-        foreach (var item in _pictures)
-        {
-            var frame = new Border { Width = Math.Max(110, item.Width), Height = Math.Max(90, item.Height), Background = Brushes.Transparent, Tag = item };
-            var grip = new Thumb { Width = 22, Height = 22, Cursor = Cursors.SizeNWSE, Background = Brushes.Transparent, BorderThickness = new Thickness(0), HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Bottom, ToolTip = Localization.Get("ResizePicture") };
-            var grid = new Grid();
-            var image = new Image { Source = item.Source, Stretch = Stretch.Uniform, Margin = new Thickness(2), HorizontalAlignment = HorizontalAlignment.Stretch, VerticalAlignment = VerticalAlignment.Stretch };
-            grid.Children.Add(image);
-            grid.Children.Add(grip);
-            var gripFlower = new TextBlock { Text = "❀", FontSize = 16, Foreground = new SolidColorBrush(Color.FromArgb(220, 207, 115, 151)), HorizontalAlignment = HorizontalAlignment.Right, VerticalAlignment = VerticalAlignment.Bottom, IsHitTestVisible = false, Opacity = 0 };
-            grid.Children.Add(gripFlower); frame.Child = grid;
-            frame.MouseEnter += (_, _) => { grip.Opacity = 1; gripFlower.Opacity = 1; };
-            frame.MouseEnter += (_, _) => { _hideUiTimer.Stop(); SetFloatingUi(true); };
-            frame.MouseLeave += (_, _) => { grip.Opacity = 0; gripFlower.Opacity = 0; ScheduleUiHide(); };
-            grip.MouseEnter += (_, _) => { _hideUiTimer.Stop(); SetFloatingUi(true); grip.Opacity = 1; gripFlower.Opacity = 1; };
-            grip.MouseLeave += (_, _) => ScheduleUiHide();
-            Canvas.SetLeft(frame, item.X); Canvas.SetTop(frame, item.Y); _canvas.Children.Add(frame);
-            frame.MouseLeftButtonDown += (_, e) => { if (grip.IsMouseOver) return; var start = e.GetPosition(_canvas); frame.CaptureMouse(); frame.MouseMove += DragMove; frame.MouseLeftButtonUp += DragEnd; frame.Tag = new object[] { item, start, item.X, item.Y, frame }; };
-            void DragMove(object s, System.Windows.Input.MouseEventArgs e) { if (!frame.IsMouseCaptured || !(frame.Tag is object[] data)) return; var p = e.GetPosition(_canvas); var start = (Point)data[1]!; var originX = (double)data[2]!; var originY = (double)data[3]!; item.X = Math.Max(0, originX + p.X - start.X); item.Y = Math.Max(0, originY + p.Y - start.Y); Canvas.SetLeft(frame, item.X); Canvas.SetTop(frame, item.Y); }
-            void DragEnd(object s, MouseButtonEventArgs e) { frame.ReleaseMouseCapture(); frame.MouseMove -= DragMove; frame.MouseLeftButtonUp -= DragEnd; _controller.SaveSettings(); }
-            frame.MouseRightButtonUp += (_, _) => { _controller.RemoveShowcasePicture(item); };
-            grip.DragDelta += (_, e) => { item.Width = Math.Max(110, item.Width + e.HorizontalChange); item.Height = Math.Max(90, item.Height + e.VerticalChange); frame.Width = item.Width; frame.Height = item.Height; };
-            grip.DragCompleted += (_, _) => _controller.SaveSettings();
-        }
-        _canvas.Width = Math.Max(Width - 56, _pictures.Select(p => p.X + p.Width + 24).DefaultIfEmpty(Width - 56).Max());
-        _canvas.Height = Math.Max(Height - 56, _pictures.Select(p => p.Y + p.Height + 24).DefaultIfEmpty(Height - 56).Max());
-    }
 }
 internal sealed class CategoryData
 {
@@ -1449,7 +1570,7 @@ public sealed class FenceWindow : Window
         _controller = controller; Model = model;
         _resizeSaveTimer = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(300) };
         _resizeSaveTimer.Tick += (_, _) => { _resizeSaveTimer.Stop(); _controller.SaveSettings(); };
-        var area = SystemParameters.WorkArea;
+        var area = controller.DesktopWorkArea;
         Title = model.Name;
         Width = model.PanelWidth;
         SizeToContent = model.IsExpanded && !double.IsNaN(model.PanelHeight) ? SizeToContent.Manual : SizeToContent.Height;
@@ -1490,6 +1611,7 @@ public sealed class FenceWindow : Window
             if (_loadedForResize) { _resizeSaveTimer.Stop(); _resizeSaveTimer.Start(); }
         };
         Loaded += (_, _) => Dispatcher.BeginInvoke(new Action(() => { ApplyNativeRoundedRegion(); WindowStyles.HideFromAltTab(this); }), System.Windows.Threading.DispatcherPriority.Loaded);
+        StateChanged += (_, _) => { if (WindowState == WindowState.Minimized) Dispatcher.BeginInvoke(new Action(KeepVisibleOnDesktop), System.Windows.Threading.DispatcherPriority.ApplicationIdle); };
         Closed += (_, _) => { _resizeSaveTimer.Stop(); Model.StopSlideshow(); _controller.SaveSettings(); };
         Loaded += (_, _) =>
         {
@@ -1504,6 +1626,19 @@ public sealed class FenceWindow : Window
             if (Top + ActualHeight > area.Bottom) Top = Math.Max(area.Top, area.Bottom - ActualHeight);
         };
         model.PropertyChanged += (_, args) => { if (args.PropertyName == nameof(CategoryModel.Name)) Title = model.Name; };
+    }
+
+    internal void MoveToSelectedMonitor()
+    {
+        var area = _controller.DesktopWorkArea;
+        Left = area.Left + Math.Max(0, Model.X);
+        Top = area.Top + Math.Max(0, Model.Y);
+    }
+
+    internal void KeepVisibleOnDesktop()
+    {
+        if (WindowState == WindowState.Minimized) WindowState = WindowState.Normal;
+        WindowStyles.SendToDesktopLayer(this);
     }
 
     private void ApplyNativeRoundedRegion()

@@ -9,6 +9,12 @@ namespace DeskSort
         private static readonly Dictionary<string, string[]> Texts = new Dictionary<string, string[]>
         {
             ["AppTitle"] = new[] { "デスク整理", "桌面整理", "Desktop Organizer" },
+            ["ShowDesktopMenu"] = new[] { "デスクトップバーを表示", "显示桌面主菜单", "Show desktop menu" },
+            ["HideDesktopMenu"] = new[] { "デスクトップバーを隠す", "隐藏桌面主菜单", "Hide desktop menu" },
+            ["DisplayMonitor"] = new[] { "表示するモニター", "显示器选择", "Display monitor" },
+            ["OnlyOneDisplay"] = new[] { "使用できるモニターは1台のみです", "当前只有一个可用显示器", "Only one display is available" },
+            ["PrimaryDisplay"] = new[] { "メイン", "主显示器", "Primary" },
+            ["Categories"] = new[] { "カテゴリー表示", "分类显示", "Categories" },
             ["Subtitle"] = new[] { "カテゴリーは個別のデスクトップ領域 · 他のウィンドウを通常どおり前面に表示できます", "分类是独立的桌面区域 · 其他窗口可以正常置顶使用", "Categories are separate desktop areas · Other windows can stay in front" },
             ["SearchDesktop"] = new[] { "デスクトップ項目を検索", "搜索桌面项目", "Search desktop items" },
             ["AddCategory"] = new[] { "＋ 追加", "＋ 添加", "＋ Add" },
@@ -70,7 +76,6 @@ namespace DeskSort
             ["AudioResize"] = new[] { "ドラッグしてモジュールのサイズを変更", "拖动调整模块大小", "Drag to resize module" },
             ["AudioError"] = new[] { "システム音声を取得できませんでした。\n", "无法获取系统声音。\n", "Could not access system audio.\n" }
             , ["StartupError"] = new[] { "自動起動の設定を変更できませんでした。\n", "无法更改开机启动设置。\n", "Could not change the startup setting.\n" }
-            , ["AddImagesError"] = new[] { "画像を追加できませんでした。\n", "无法添加图片。\n", "Could not add images.\n" }
             , ["SaveSettingsError"] = new[] { "設定を保存できませんでした: ", "无法保存设置：", "Could not save settings: " }
             , ["DesktopNotFound"] = new[] { "デスクトップフォルダーが見つかりません。", "未找到桌面文件夹。", "Desktop folder was not found." }
             , ["DesktopLoadError"] = new[] { "デスクトップを読み込めませんでした: ", "无法读取桌面：", "Could not load the desktop: " }
@@ -97,13 +102,6 @@ namespace DeskSort
             , ["CategoryImageLoadError"] = new[] { "画像を読み込めませんでした: ", "无法读取图片：", "Could not load image: " }
             , ["EnterCategoryName"] = new[] { "カテゴリー名を入力してください。", "请输入分类名称。", "Enter a category name." }
             , ["Decision"] = new[] { "決定", "确定", "OK" }
-            , ["GalleryTitle"] = new[] { "趣味ギャラリー", "兴趣展示", "Hobby Gallery" }
-            , ["GalleryMove"] = new[] { "ここをドラッグして展示全体を移動", "拖动此处移动展示区域", "Drag here to move the gallery" }
-            , ["GalleryAdd"] = new[] { "画像を追加", "添加图片", "Add images" }
-            , ["GalleryClose"] = new[] { "展示を閉じる", "关闭展示", "Close gallery" }
-            , ["GalleryResize"] = new[] { "ドラッグして展示領域を拡大・縮小", "拖动调整展示区域大小", "Drag to resize gallery" }
-            , ["SelectGalleryImages"] = new[] { "表示する画像を選択", "选择要显示的图片", "Choose images to display" }
-            , ["ResizePicture"] = new[] { "ドラッグして画像サイズを変更", "拖动调整图片大小", "Drag to resize image" }
             , ["CategoryIconTitle"] = new[] { "カテゴリー画像", "分类图标", "Category image" }
             , ["BackgroundImageSuffix"] = new[] { "背景画像", "背景图片", "Background image" }
             , ["DeleteCategoryQuestion"] = new[] { "カテゴリーを削除", "删除分类", "Delete category" }
